@@ -28,8 +28,8 @@ def run_linear(
     Returns:
         Float[Tensor, "... d_out"]: The transformed output of your linear module.
     """
-
-    raise NotImplementedError
+    out = in_features @ weights.transpose(-1, -2)
+    return out
 
 
 def run_embedding(
@@ -50,8 +50,7 @@ def run_embedding(
     Returns:
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
-
-    raise NotImplementedError
+    return weights[token_ids] # a process of looking up table
 
 
 def run_swiglu(
@@ -378,7 +377,10 @@ def run_rmsnorm(
         Float[Tensor,"... d_model"]: Tensor of with the same shape as `in_features` with the output of running
         RMSNorm of the `in_features`.
     """
-    raise NotImplementedError
+    in_features = in_features.to(torch.float32)
+    rms_denom = torch.sqrt((1 / d_model) * torch.sum(in_features ** 2) + eps)
+    result = (in_features / rms_denom) * weights
+    return result
 
 
 def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
@@ -415,7 +417,17 @@ def run_get_batch(
         is the sampled input sequences, and the second tuple item is the corresponding
         language modeling labels.
     """
-    raise NotImplementedError
+    max_start_index = len(dataset) - context_length
+    start_indices = torch.randint(low=0, high=max_start_index, size=(batch_size, ))
+    inputs = torch.zeros((batch_size, context_length), dtype=torch.long)
+    labels = torch.zeros((batch_size, context_length), dtype=torch.long)
+    for i in range(batch_size):
+        start_idx = start_indices[i]
+        sequence = dataset[start_idx: start_idx + context_length + 1] # select 8 tokens
+        inputs[i] = torch.tensor(sequence[:-1], dtype=torch.long)
+        labels[i] = torch.tensor(sequence[1:], dtype=torch.long)
+    
+    return inputs.to(device), labels.to(device)
 
 
 def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, " ..."]:
