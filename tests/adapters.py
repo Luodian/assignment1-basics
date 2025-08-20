@@ -82,7 +82,13 @@ def run_swiglu(
     # swiglu.w1.weight.data = w1_weight
     # swiglu.w2.weight.data = w2_weight
     # swiglu.w3.weight.data = w3_weight
-    raise NotImplementedError
+    # d_model, d_ff \times bs, d_ff
+    result = run_silu(in_features @ w1_weight.transpose(-1, -2)) * (in_features @ w3_weight.transpose(-1, -2)) @ w2_weight.transpose(-1, -2)
+    # You should set dff to approximately 8
+    # 3 × dmodel in your implementation, while ensuring that
+    # the dimensionality of the inner feed-forward layer is a multiple of 64 to make good use of your
+    # hardware.
+    return result
 
 
 def run_scaled_dot_product_attention(
@@ -378,7 +384,9 @@ def run_rmsnorm(
         RMSNorm of the `in_features`.
     """
     in_features = in_features.to(torch.float32)
-    rms_denom = torch.sqrt((1 / d_model) * torch.sum(in_features ** 2) + eps)
+    weights = weights.to(torch.float32)
+    # rms_denom = torch.sqrt(torch.sum(in_features.pow(2)) / d_model + eps)
+    rms_denom = torch.sqrt(in_features.pow(2).sum(dim=-1, keepdim=True) / d_model + eps)
     result = (in_features / rms_denom) * weights
     return result
 
@@ -394,7 +402,8 @@ def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
         Float[Tensor,"..."]: of with the same shape as `in_features` with the output of applying
         SiLU to each element.
     """
-    raise NotImplementedError
+    silu_result = in_features * torch.sigmoid(in_features)
+    return silu_result
 
 
 def run_get_batch(
