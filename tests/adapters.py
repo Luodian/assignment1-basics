@@ -90,7 +90,7 @@ def run_swiglu(
     # hardware.
     return result
 
-
+import math
 def run_scaled_dot_product_attention(
     Q: Float[Tensor, " ... queries d_k"],
     K: Float[Tensor, " ... keys d_k"],
@@ -109,7 +109,12 @@ def run_scaled_dot_product_attention(
     Returns:
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
-    raise NotImplementedError
+    d_k = Q.shape[-1] # bs, seqlen, d_k
+    logits = (Q @ K.transpose(-1, -2)) / math.sqrt(d_k)
+    if mask is not None:
+        logits = logits.masked_fill(mask == 0, float("-inf"))
+    attns = run_softmax(logits, -1) @ V
+    return attns
 
 
 def run_multihead_self_attention(
@@ -143,8 +148,33 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    # d_k = d_v = d_model / num_heads
+    # seqlen = in_features.shape[-2]
+    # Q = torch.cat([in_features @ q_proj_weight.transpose(-1, -2) for i in range(num_heads)], dim=-1) # bs, seqlen, d_model
+    # K = torch.cat([in_features @ k_proj_weight.transpose(-1, -2) for i in range(num_heads)], dim=-1)
+    # V = torch.cat([in_features @ v_proj_weight.transpose(-1, -2) for i in range(num_heads)], dim=-1)
+    # mask = torch.tril(torch.ones(seqlen, seqlen, device=in_features.device))
+    # attns = run_scaled_dot_product_attention(Q, K, V, mask) # seqlen, seqlen
+    # attns = torch.cat([attns[..., i, :] @ o_proj_weight.transpose(-1, -2) for i in range(num_heads)], dim=-1)
+    # return attns
+    batch_size = in_features.shape[0]
+    seqlen = in_features.shape[1]
+    d_k = d_model // num_heads
+    Q = (in_features @ q_proj_weight.transpose(-1, -2)).view(batch_size, seqlen, num_heads, d_k)
+    K = (in_features @ k_proj_weight.transpose(-1, -2)).view(batch_size, seqlen, num_heads, d_k)
+    V = (in_features @ v_proj_weight.transpose(-1, -2)).view(batch_size, seqlen, num_heads, d_k)
 
+    Q = Q.transpose(1, 2) # bs, nheads, seqlen, d_k
+    K = K.transpose(1, 2) # bs, nheads, seqlen, d_k
+    V = V.transpose(1, 2) # bs, nheads, seqlen, d_k
+
+    mask = torch.tril(torch.ones(seqlen, seqlen, device=in_features.device))
+    mask = mask.expand(batch_size, num_heads, seqlen, seqlen)
+
+    attn_output = run_scaled_dot_product_attention(Q, K, V, mask) # bs, nheads, seqlen, d_k
+    attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seqlen, d_model)
+    output = attn_output @ o_proj_weight.transpose(-1, -2)
+    return output
 
 def run_multihead_self_attention_with_rope(
     d_model: int,
@@ -183,7 +213,44 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    batch_size = in_features.shape[0]
+    seqlen = in_features.shape[1]
+    d_k = d_model // num_heads
+    
+    # Linear projections
+    Q = (in_features @ q_proj_weight.transpose(-1, -2)).view(batch_size, seqlen, num_heads, d_k)
+    K = (in_features @ k_proj_weight.transpose(-1, -2)).view(batch_size, seqlen, num_heads, d_k)
+    V = (in_features @ v_proj_weight.transpose(-1, -2)).view(batch_size, seqlen, num_heads, d_k)
+
+    # Transpose to get heads in the right position
+    Q = Q.transpose(1, 2)  # (batch_size, num_heads, seqlen, d_k)
+    K = K.transpose(1, 2)  # (batch_size, num_heads, seqlen, d_k)
+    V = V.transpose(1, 2)  # (batch_size, num_heads, seqlen, d_k)
+
+    # Apply RoPE to Q and K
+    if token_positions is None:
+        token_positions = torch.arange(seqlen, device=in_features.device).unsqueeze(0).expand(batch_size, -1)
+    
+    # Apply RoPE to each head separately
+    Q_roped = torch.zeros_like(Q)
+    K_roped = torch.zeros_like(K)
+    
+    for head in range(num_heads):
+        Q_roped[:, head] = run_rope(d_k, theta, max_seq_len, Q[:, head], token_positions)
+        K_roped[:, head] = run_rope(d_k, theta, max_seq_len, K[:, head], token_positions)
+
+    # Create causal mask
+    mask = torch.tril(torch.ones(seqlen, seqlen, device=in_features.device))
+    mask = mask.expand(batch_size, num_heads, seqlen, seqlen)
+
+    # Attention computation
+    attn_output = run_scaled_dot_product_attention(Q_roped, K_roped, V, mask)
+    
+    # Reshape and apply output projection
+    attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seqlen, d_model)
+    output = attn_output @ o_proj_weight.transpose(-1, -2)
+    
+    return output
 
 
 def run_rope(
@@ -205,7 +272,35 @@ def run_rope(
     Returns:
         Float[Tensor, " ... sequence_length d_k"]: Tensor with RoPEd input.
     """
-    raise NotImplementedError
+    device = in_query_or_key.device
+    
+    # Create frequency tensor
+    freqs = 1.0 / (theta ** (torch.arange(0, d_k, 2, device=device).float() / d_k))
+    
+    # Get positions - expand to match input shape
+    pos = token_positions.float().unsqueeze(-1)  # (..., seq_len, 1)
+    
+    # Compute angles
+    angles = pos * freqs.unsqueeze(0)  # (..., seq_len, d_k//2)
+    
+    # Compute sin and cos
+    cos_vals = torch.cos(angles)
+    sin_vals = torch.sin(angles)
+    
+    # Split the input into even/odd components
+    x_even = in_query_or_key[..., 0::2]  # (..., seq_len, d_k//2)
+    x_odd = in_query_or_key[..., 1::2]   # (..., seq_len, d_k//2)
+    
+    # Apply RoPE rotation
+    rotated_even = x_even * cos_vals - x_odd * sin_vals
+    rotated_odd = x_even * sin_vals + x_odd * cos_vals
+    
+    # Interleave back together
+    output = torch.zeros_like(in_query_or_key)
+    output[..., 0::2] = rotated_even
+    output[..., 1::2] = rotated_odd
+    
+    return output
 
 
 def run_transformer_block(
@@ -452,7 +547,13 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
         Float[Tensor, "..."]: Tensor of with the same shape as `in_features` with the output of
         softmax normalizing the specified `dim`.
     """
-    raise NotImplementedError
+    # in_features = in_features - 
+    # return torch.exp(in_features - torch.max(in_features)) / torch.sum(torch.exp(in_features - torch.max(in_features)))
+    # raise NotImplementedError
+    max_values = torch.max(in_features, dim=dim, keepdim=True).values
+    exp_features = torch.exp(in_features - max_values)
+    sum_exp = torch.sum(exp_features, dim=dim, keepdim=True)
+    return exp_features / sum_exp
 
 
 def run_cross_entropy(
